@@ -1,15 +1,52 @@
 // ==UserScript==
 // @name        Batch Downloader
 // @description Batch Download image
-// @version     0.1.0
+// @version     0.2.0
 // @include     *://localhost*
 // @include     *://i.imgur.com/*
+// @include     *://*.archive.org/BookReader/BookReader*.php?*
 // @grant       none
 // @require     https://raw.githubusercontent.com/Stuk/jszip/v3.1.5/dist/jszip.min.js
 // @require     https://raw.githubusercontent.com/eligrey/FileSaver.js/master/dist/FileSaver.min.js
 // ==/UserScript==
 
 var waitForElement = 'body';
+var poolSize = 5;
+
+var pool = {}, poolQueue = {};
+
+var addToPool = function(id, f){
+    // if (Object.keys(pool).length < poolSize) {
+    //     // add to pool and proc
+    //     pool[id] = f().then(res => {
+    //         delete pool[id]
+    //         return res
+    //     });
+    //     return pool[id]
+    // }
+    const promisesPoolQueue = Object.values(poolQueue);
+    poolQueue[id] = Promise.all(promisesPoolQueue)
+        .then(_ => {
+            const promisesPool = Object.values(pool);
+            if (Object.keys(pool).length < poolSize) {
+                // pool still has space
+                return Promise.resolve(id)
+            }
+            // wait until pool has space
+            return Promise.race(promisesPool)
+        }).then(_ => {
+            delete poolQueue[id]
+            return id
+        })
+    // return promise of waiting in queue followed by proc
+    return poolQueue[id].then(_ => {
+            pool[id] = f().then(res => {
+                delete pool[id]
+                return res
+            });
+            return pool[id]
+        });
+}
 
 var getEl = function (q, c) {
     if (!q) return;
@@ -54,58 +91,75 @@ var createPageBox = function(url, name, inZip){
         'padding': '5px',
         'margin': '0 10px 10px 0',
     });
+    let pageStyleStr = toStyleStr({
+        'background-color': 'red',
+    },'.ml-page-error')
+    +toStyleStr({
+        'background-color': 'gray',
+    },'.ml-page-queue')
+    +toStyleStr({
+        'background-color': 'gray',
+    },'.ml-page-fetch');
+
     let pageBox = document.createElement('tr');
-    // pageBox.setAttribute('style', boxStyleStr || '');
+    pageBox.className = 'ml-page-ready'
 
     let msgText = document.createElement('a');
-    // msgText.className = 'ml-floating-text';
     msgText.textContent = name;
     msgText.href = url
     let msgTextCol = document.createElement('td');
     msgTextCol.appendChild(msgText);
 
     let msgTextErr = document.createElement('td');
-    // msgTextErr.className = 'ml-floating-textbox';
     msgTextErr.textContent = '[Ready]';
     msgTextErr.title = '';
-    // msgTextErr.setAttribute('style', textStyleStr || '');
 
     let action = function (evt) {
-        pageBox.status = 'fetch';
-        msgTextErr.textContent = '[Fetch]';
+        pageBox.className = 'ml-page-queue'
+        msgTextErr.textContent = '[Queue]';
         msgTextErr.title = ''
-        fetch(url).then(response => {
-            if (response.status === 200 || response.status === 0) {
-                return Promise.resolve(response.blob());
-            } else {
-                return Promise.reject(new Error(response.statusText));
-            }
+        addToPool(name, () => {
+            pageBox.className = 'ml-page-fetch'
+            msgTextErr.textContent = '[Fetch]';
+            msgTextErr.title = ''
+            return fetch(url).then(response => {
+                if (response.status === 200 || response.status === 0) {
+                    return Promise.resolve(response.blob());
+                } else {
+                    return Promise.reject(new Error(response.statusText));
+                }
+            })
+            .then(blob => {
+                if (pageBox.className != 'ml-page-done') {
+                    pageBox.className = 'ml-page-done'
+                    msgTextErr.textContent = '[Done]';
+                    msgTextErr.title = ''
+                    inZip.file(
+                        name,
+                        blob,
+                    );
+                }
+            })
+            .catch(err => {
+                if (pageBox.className != 'ml-page-done') {
+                    pageBox.className = 'ml-page-error'
+                    msgTextErr.textContent = '[Error]';
+                    msgTextErr.title = err
+                }
+            })
         })
-        .then(blob => {
-            if (pageBox.status != 'done') {
-                pageBox.status = 'done'
-                msgTextErr.textContent = '[Done]';
-                msgTextErr.title = ''
-                inZip.file(
-                    name,
-                    blob,
-                );
-            }
-        })
-        .catch(err => {
-            if (pageBox.status != 'done') {
-                pageBox.status = 'error'
-                // pageBox.tooltip = err
-                msgTextErr.textContent = '[Error]';
-                msgTextErr.title = err
-            }
-        })
+
     };
 
     let retryButton = createButton('Retry', action, buttonStyleStr)
+    retryButton.className = 'ml-button-retry'
     let buttonCol = document.createElement('td');
     buttonCol.appendChild(retryButton);
 
+    let styleEle = document.createElement('style');
+    styleEle.textContent = pageStyleStr;
+
+    pageBox.appendChild(styleEle);
     pageBox.appendChild(msgTextCol);
     pageBox.appendChild(msgTextErr);
     pageBox.appendChild(buttonCol);
@@ -131,6 +185,25 @@ var addPages = function(startNum, endNum, nameTemplate, urlText, box, inZip){
             box.appendChild(pageBox);
         })
     }
+}
+
+var autoUpdatePageStats = function(box, stats){
+    console.log('Start Timer');
+    let intervalId = setInterval(function () {
+        let pageDone = getEls('.ml-page-done', box);
+        let pageFail = getEls('.ml-page-error', box);
+        let pageQueue = getEls('.ml-page-queue', box);
+        let pageFetch = getEls('.ml-page-fetch', box);
+        let inProc = pageQueue.length+pageFetch.length
+        stats.textContent = 
+            pageDone.length + ' Done / '+
+            pageFail.length + ' Fail / '+
+            inProc+' Queue\'d';
+        if (inProc <= 0) {
+            console.log('Timer Finished');
+            clearInterval(intervalId);
+        }
+    }, 500);
 }
 
 var downloadZIP = function (inZip, updatePercent) {
@@ -184,20 +257,19 @@ var initBatchDownload = function(){
     pagesStyleStr = toStyleStr({
         'max-height': '150px',
         'overflow': 'scroll',
-        'background-color': 'gray',
+        // 'background-color': 'gray',
     });
-    // TODO: figure out style and stuff
     // create main box
     let batchBox = document.createElement('pre');
     batchBox.className = 'ml-floating-box';
     batchBox.setAttribute('style', boxStyleStr || '');
-    // create startNum, endNum slider (?)
+    // create startNum, endNum slider
     let sliderStartNum = document.createElement('input');
     sliderStartNum.className = 'in-slider-start';
     sliderStartNum.size = '5';
-    // sliderStartNum.value = '0';
     sliderStartNum.type = 'number';
     sliderStartNum.placeholder = 'start';
+    // sliderStartNum.value = '0';
     let sliderEndNum = document.createElement('input');
     sliderEndNum.className = 'in-slider-end';
     sliderEndNum.type = 'number';
@@ -223,6 +295,20 @@ var initBatchDownload = function(){
     pageBoxContainer.appendChild(pageTable);
     pageTable.appendChild(pageTbody);
     pageBoxContainer.setAttribute('style', pagesStyleStr || '');
+    // create page dl status text
+    let pageStatsText = document.createElement('div');
+    pageStatsText.className = 'ml-floating-text';
+    pageStatsText.textContent = '0 Done / 0 Fail / 0 Queue\'d';
+    // create retry all button
+    let retryFailButton = createButton('Retry Fail', function (evt) {
+        let pageFailButton = getEls('.ml-page-error .ml-button-retry', pageTbody);
+        console.log('Retry ',pageFailButton.length,' Failed Pages');
+        pageFailButton.forEach(pageButton => {
+            pageButton.click()
+        })
+        // restart timer for download status
+        autoUpdatePageStats(pageTbody, pageStatsText)
+    }, buttonStyleStr);
     // init zipFile
     let zipFile = new JSZip();
     // create fetch button
@@ -233,6 +319,8 @@ var initBatchDownload = function(){
             urls = inputUrls.value;
         console.log("Fetch Started");
         addPages(startNum, endNum, nameTemplate, urls, pageTbody, zipFile)
+        // start timer for download status
+        autoUpdatePageStats(pageTbody, pageStatsText)
     }, buttonStyleStr);
     // create download button
     let downloadButton = createButton('Download', function (evt) {
@@ -242,6 +330,10 @@ var initBatchDownload = function(){
             console.log("ZIP Created");
         });
     }, buttonStyleStr);
+
+    batchBox.appendChild(pageStatsText);
+    batchBox.appendChild(document.createTextNode(' '))
+    batchBox.appendChild(retryFailButton);
 
     batchBox.appendChild(pageBoxContainer);
 
